@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+
+'''Server-side pre-receive hook
+
+This script check if SVN updated, fetch SVN revision to GIT
+and convert GIT commit to SVN repo.
+'''
+
+import os
+import sys
+import shutil
+import subprocess
+import time
+import configparser
+import fasteners
+
+project_path = os.getcwd()
+tmp_path = ""
+# svn_url = ""
+svn_url = "svn://10.17.10.190/sample_repo"
+svn_repo_path = ""
+lock_file = "pre-receive.lock"
+lock = None
+
+
+def get_commits(oldhash, newhash):
+    """ Return commit hash list between oldhash and newhash
+
+    Args:
+        oldhash(string): last commit hash that remote repo's HEAD indicates
+        newhash(string): new commit hash local repo's HEAD indicates
+    """
+
+    cmd = "git rev-list " + oldhash + ".." + newhash
+    proc = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    commits = [_ for _ in proc.communicate()[0].decode("utf-8").split("\n") if _]
+
+    return commits
+
+
+def commit_svn(commits):
+    """ Make patch and commit svn
+
+    Args:
+        commits(list): newly pushed commit hash list
+    """
+
+    num_commit = len(commits)
+    if num_commit:
+        index = 1
+
+    # make patch from commit and generste to svn repo
+    for commit in reversed(commits):
+
+        print("[pre-receive] [" + str(index) + "/" + str(num_commit) + "] " + commit)
+        index += 1
+
+        # get commit committer
+        cmd = "git log -1 " + commit + " --pretty=%cn"
+        committer = ret_command(cmd).split("\n")[0]
+        print("[pre-receive] * committer: " + committer)
+
+        # get commit email
+        cmd = "git log -1 " + commit + " --pretty=%ce"
+        email = ret_command(cmd).split("\n")[0]
+        print("[pre-receive] * email addr: " + email)
+
+        # get commit message
+        cmd = "git log -1 " + commit + " --format=%B"
+        subject = ret_command(cmd)
+        print("[pre-receive] * commit message: \n" + subject)
+
+        # make patch and generate to svn repo
+        global tmp_path
+        global svn_repo_path
+        if os.path.isdir(tmp_path):
+            # make git commit patch
+            print("[pre-receive] - create commit's patch")
+            cmd = (
+                "git diff-tree "
+                + commit
+                + " -p --no-prefix > "
+                + tmp_path
+                + "/"
+                + commit
+                + ".patch"
+            )
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                release_lock()
+                sys.exit(1)
+
+            # svn up
+            print("[pre-receive] - svn up")
+            cmd = "svn up " + svn_repo_path
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                release_lock()
+                sys.exit(1)
+
+            # generate patch to svn repo
+            print("[pre-receive] - generate patch to svn repo")
+            os.chdir(svn_repo_path + "/trunk")
+            cmd = (
+                "patch -p0 --fuzz 0 --no-backup-if-mismatch -r /tmp/temp.rej < "
+                + tmp_path
+                + "/"
+                + commit
+                + ".patch"
+            )
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                print(
+                    "[pre-receive] [ERR] It seemed remote generated new commit before this push."
+                )
+                print("[pre-receive] [ERR] Hint: Try $ git pull --rebase origin master")
+                print("[pre-receive] [ERR] and push again.")
+
+                release_lock()
+                sys.exit(1)
+
+            # svn add
+            print("[pre-receive] - svn add")
+            cmd = "svn add * --force"
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                release_lock()
+                sys.exit(1)
+
+            # svn commit
+            print("[pre-receive] - svn commit")
+            cmd = (
+                'svn commit -m "'
+                + subject
+                + '" --username seojikim --password 12345678'
+            )
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                release_lock()
+                sys.exit(1)
+
+            # get svn revision
+            cmd = "svn info --show-item revision " + svn_url
+            revision = ret_command(cmd).split("\n")[0]
+            print("[pre-receive] * svn revision: " + revision)
+
+            # change svn commit's author as git comitter
+            print("[pre-receive] - change svn commit's author as git commiter")
+            cmd = (
+                "svn ps --revprop -r "
+                + revision
+                + " svn:author "
+                + "'"
+                + committer
+                + "'"
+                + " "
+                + svn_url
+                + " --username seojikim --password 12345678"
+            )
+            p = subprocess.run(cmd, shell=True)
+            if p.returncode != 0:
+                release_lock()
+                sys.exit(1)
+
+
+def ret_command(_cmd):
+    """ Return value of command or return code
+
+    Args:
+        _cmd(string): command string to run
+    """
+
+    proc = subprocess.Popen(
+        _cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    return proc.communicate()[0].decode("utf-8")
+
+
+def main():
+    """ Pre-receive main function
+
+    1. Get commit list.
+    2. Convert commit to SVN
+    """
+
+    # ENV
+    repo_path = ret_command("pwd").split("\n")[0]
+    repo_name = os.path.basename(repo_path)
+
+    global tmp_path
+    tmp_path = "/tmp/" + repo_name
+    if not os.path.isdir(tmp_path):
+        os.system("mkdir -p " + tmp_path)
+
+    # TODO move to parameter
+    global svn_url
+    global svn_repo_path
+    svn_url = "svn://10.17.10.190/sample_repo"
+    svn_repo_path = tmp_path + "/" + os.path.basename(svn_url)
+
+    # Config # TODO
+    """
+    os.system("whoami")
+    config = ConfigParser.ConfigParser()
+    config.read("svngit/config")
+    svn_url = config.get("svn", "url")
+    print(svn_url)
+    """
+
+    # Get Info
+    oldhash, newhash, ref = sys.stdin.readline().split()
+    print("[pre-receive] Hook Input: ", end="")
+    print(oldhash, newhash, ref)
+
+    # 1. Get newly pushed commits
+    print("[pre-receive] (1) Get new commits info")
+    new_commits = get_commits(oldhash, newhash)
+
+    # TODO: fetch from svn repository
+
+    # 2. Convert commit to SVN
+    print("[pre-receive] (2) Convert pushed commits to SVN.")
+    commit_svn(new_commits)
+
+    # 3. Save fetched revision
+    fetched_rev = get_revision()
+    print("[pre-receive] svn revision: " + fetched_rev)
+    # save fetched revision
+    with open(project_path + "/svngit/fetched_rev", "w") as outfile:
+        outfile.write(fetched_rev)
+
+
+def get_current_revision():
+    """Get svn revision
+
+    Return:
+        rev (int): return current svn revision
+    """
+
+    global svn_url
+
+    cmd = "svn info --show-item revision " + svn_url
+    rev = ret_command(cmd).split("\n")[0]
+
+    return rev
+
+
+def get_fetched_revision():
+    """Get fetched revision
+
+    Returns:
+        _rev (int): fetched_rev set in svngit/fetched_rev
+    """
+
+    with open("svngit/fetched_rev", "r") as outfile:
+        _rev = outfile.read()
+
+    return _rev
+
+
+def get_revisions(fetched_rev, rev):
+    """Get revision list between fetched revision and current svn's revision
+
+    Args:
+        fetched_rev (int): fetched revision number in git repo
+        rev (int): current revision number from svn repo
+    Reteruns:
+        revisions (List): updated svn revision list
+    """
+    revisions = []
+    if fetched_rev < rev:
+        revisions = [_ for _ in range(fetched_rev + 1, rev + 1)]
+
+    return revisions
+
+
+def svn_fetch():
+    """Fetch svn revision to Git repo
+    """
+
+    global svn_url
+    global project_path
+    svn_tmp_path = project_path + "/svngit/sample_repo"
+
+    # get fetched revision
+    fetched_rev = int(get_fetched_revision())
+    print("[pre-receive] fetched_rev: " + str(fetched_rev), end=", ")
+
+    # get current svn revision
+    rev = int(get_current_revision())
+    print("rev: " + str(rev))
+
+    # 0. get diff revision list
+    revisions = get_revisions(fetched_rev, rev)
+    if len(revisions) == 0:
+        return
+
+    # checkout empty svn repo
+    print("[pre-receive] checkout revision changed files")
+    cmd = "svn co --depth empty " + svn_url + " " + svn_tmp_path
+    print(cmd)
+    p = subprocess.run(cmd, shell=True)
+    if p.returncode != 0:
+        release_lock()
+        sys.exit(1)
+
+    tot = len(revisions)
+    cnt = 0
+    # fetch svn commit to git repo
+    for rev in revisions:
+        cnt += 1
+        print("[pre-receive] rev: " + str(rev) + " [" + str(cnt) + "/" + str(tot) + "]")
+
+        # 1. get changed file list
+        cmd = (
+            "svn diff -c "
+            + str(rev)
+            + " "
+            + svn_url
+            + " | grep \"Index\" | awk '{print $2}'"
+        )
+        mod_files = [
+            _
+            for _ in subprocess.check_output(cmd, shell=True)
+            .decode("utf-8")
+            .split("\n")
+            if _
+        ]
+        print(mod_files)
+
+        # 2. checkout changed files
+        os.chdir(svn_tmp_path)
+        cmd = (
+            "svn diff -c "
+            + str(rev)
+            + " "
+            + svn_url
+            + " | grep \"Index\" | awk '{print $2}' | xargs -n 1 svn update --parents -r "
+            + str(rev)
+        )
+        print(cmd)
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, shell=True)
+        if p.returncode != 0:
+            release_lock()
+            sys.exit(1)
+
+        # 3. copy changed files to work tree
+        for mod_file in mod_files:
+            print(mod_file)
+            # cmd = "git "
+
+        # 4. make commit
+
+        # 5. update refs - plumbing
+
+        # 6. update fetched_rev
+
+    # shutil.rmtree(svn_tmp_path)
+
+
+def release_lock():
+    global project_path
+    global lock_file
+    global lock
+
+    if lock:
+        lock.release()
+
+    if os.path.exists(project_path + "/" + lock_file):
+        os.remove(project_path + "/" + lock_file)
+    print("[pre-receive] release pre-receive.lock")
+
+
+if __name__ == "__main__":
+
+    start = time.time()
+
+    # prevent concurrent run pre-receive
+    print("[pre-receive] acquire pre-receive.lock")
+    lock = fasteners.InterProcessLock(lock_file)
+    ret = lock.acquire(timeout=10)
+
+    # If not lock acquired, reject push
+    if ret is False:
+        release_lock()
+        sys.exit(1)
+
+    # svn fetch test
+    # svn_fetch()
+
+    # sync svn and git
+    # main()
+
+    # release pre-receive lock
+    release_lock()
+    print(f"{time.time() - start: .5f} sec")
+
+    sys.exit(1)
